@@ -1,159 +1,66 @@
-name: Infrastructure - Plan and apply
+provider "aws" {
+  region = var.region
+}
 
-env:
-  package_name: gitops
+terraform {
+  backend "s3" {
+    bucket         = "lf-devops-gitops-terraform-state"
+    key            = "terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform_state"
+  }
+}
 
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: Environment
-        required: true
-        type: choice
-        options:
-          - 'dev'
-          - 'prod'
+resource "aws_s3_bucket" "tf_backend_bucket" {
+  bucket = var.tf_backend_bucket_name
+  tags = {
+    "Name"      = "ashutosh-s3-bucket"
+    "Deletable" = "Yes"
+    "Creator"   = "baralashutosh0@gmail.com"
+    "Project"   = "Intern"
+  }
+}
 
-  pull_request:
-    types: [synchronize, closed, opened]
-    branches:
-      - dev
-      - main
+resource "aws_s3_bucket_versioning" "tf_backend_bucket_versioning" {
+  bucket = aws_s3_bucket.tf_backend_bucket.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
 
-jobs:
-  resolve-env:
-    runs-on: ubuntu-latest
-    steps:
-      - name: resolve environment
-        run: |
-          branch_ref=${{ github.base_ref }}
-          if [[ "$branch_ref" == "main" ]] || ${{ contains(github.event.inputs.environment, 'prod') }}; then
-            echo "env_name=prod" >> $GITHUB_ENV
-          else
-            echo "env_name=dev" >> $GITHUB_ENV
-          fi
-    outputs:
-      env_name: '${{ env.env_name }}'
+resource "aws_s3_bucket_object_lock_configuration" "tf_backend_bucket_object_lock" {
+  depends_on          = [aws_s3_bucket.tf_backend_bucket]
+  bucket              = aws_s3_bucket.tf_backend_bucket.id
+  object_lock_enabled = "Enabled"
+}
 
-  build:
-    name: Deploy and Release
-    runs-on: ubuntu-latest
-    needs: [resolve-env]
-    environment: ${{ needs.resolve-env.outputs.env_name }}
-    env:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
-      TF_IN_AUTOMATION: true
-    steps:
+resource "aws_s3_bucket_server_side_encryption_configuration" "tf_backend_bucket_sse" {
+  bucket = aws_s3_bucket.tf_backend_bucket.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "aws:kms"
+    }
+  }
+}
 
-      - name: Checkout
-        uses: actions/checkout@v3
+resource "aws_dynamodb_table" "tf_backend_bucket_state_lock" {
+  name           = "terraform_state_ashutosh"
+  read_capacity  = 1
+  write_capacity = 1
+  hash_key       = "LockID"
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+  tags = {
+    "Name"      = "DynamoDB Terraform State Lock Table ashutosh"
+    "Deletable" = "Yes"
+    "Creator"   = "baralashutosh0@gmail.com"
+    "Project"   = "Intern"
+  }
+}
 
-      - name: Configure terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: 1.5.0
-
-      - name: Terraform format
-        run: terraform fmt -check -recursive
-
-      - name: Terraform init
-        run: terraform init
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-
-      - name: Terraform validate
-        run: terraform validate
-
-      - name: Switch to required workspace
-        run: terraform workspace select $WORKSPACE
-        env:
-          WORKSPACE: ${{ needs.resolve-env.outputs.env_name }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-
-      - name: Terraform plan
-        run: terraform plan
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-
-      - name: Terraform apply
-        if: github.event.pull_request.merged || github.event_name == 'workflow_dispatch'
-        run: terraform apply --auto-approve
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-
-      - name: Setup semver bash
-        run: |
-          sudo curl https://raw.githubusercontent.com/fsaintjacques/semver-tool/3.0.0/src/semver -o /usr/local/bin/semver && sudo chmod +x /usr/local/bin/semver
-          semver --version
-      
-      - name: Get version
-        id: get-version
-        run: |
-          git fetch --tags
-          last_version=$(git tag --sort=-version:refname | grep -P "^$package_name@v\d+.\d+.\d+$" | head -n 1 | cut -d v -f 2)
-
-          if [ -z "$last_version" ]; then
-            new_version=1.0.0
-          elif [[ ${{ github.head_ref }} =~ ^"major" ]]; then
-            new_version=$(semver bump major "$last_version")
-          elif [[ ${{ github.head_ref }} =~ ^"feat" ]]; then
-            new_version=$(semver bump minor "$last_version")
-          else
-            new_version=$(semver bump patch "$last_version")
-          fi
-
-          echo "new_version=$new_version" >> $GITHUB_OUTPUT
-
-      - name: Prepare artifact
-        id: prep
-        run: |
-          BUILD_NUM=$(echo $GITHUB_RUN_NUMBER)
-          BUILD_ID=$(echo $GITHUB_SHA | head -c7)
-
-          if [[ ${{ github.event.pull_request.merged }} == 'true' ]]; then
-            VERSION=${SCOPE}@v${RELEASE_VERSION}
-          else
-            VERSION=${SCOPE}@v${RELEASE_VERSION}+build.${BUILD_NUM}.${BUILD_ID}
-          fi
-
-          ARTIFACT_NAME=${VERSION}.zip
-          zip dist -r *.tf
-          mv dist.zip ${ARTIFACT_NAME}
-          ls -al
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
-        env:
-          SCOPE: ${{ env.package_name }}
-          RELEASE_VERSION: ${{ steps.get-version.outputs.new_version }}
-
-      - name: Push Tag
-        if: github.event.pull_request.merged
-        id: tag_version
-        uses: mathieudutour/github-tag-action@v5.6
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          custom_tag: ${{ steps.prep.outputs.version }}
-          tag_prefix: ""
-
-      - name: Create release
-        if: github.event.pull_request.merged
-        uses: "marvinpinto/action-automatic-releases@latest"
-        with:
-          repo_token: "${{ secrets.GH_TOKEN }}"
-          prerelease: false
-          title: ${{ steps.prep.outputs.version }}
-          automatic_release_tag: ${{ steps.prep.outputs.version }}
-          files: |
-            ${{ steps.prep.outputs.artifact_name }}
+resource "aws_codecommit_repository" "gitops_demo_repo" {
+  repository_name = var.devops_interns_repo_name
+  description     = "Created for \"GitOps with Terraform\" session"
+}
