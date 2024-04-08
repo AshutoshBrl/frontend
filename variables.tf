@@ -3,7 +3,7 @@ variable "region" {
 }
 
 variable "tf_backend_bucket_name" {
-  default = "lf-devops-gitops-terraform-state-ash"
+  default = "lf-devops-gitops-terraform-state"
 }
 
 variable "devops_interns_repo_name" {
